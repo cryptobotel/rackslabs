@@ -1,61 +1,90 @@
 import yfinance as yf
+import requests
+import json
 
 # --- Screener Configuration ---
-GAP_THRESHOLD = 0.15  # The minimum gap percentage to be considered
-TICKERS_TO_SCAN = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'MRNA', 'GME', 'AMC']
+GAP_THRESHOLD = 0.15
+MARKET_CAP_LIMIT = 300_000_000
 
 # --- GapScore Configuration ---
-# Keywords for catalyst scoring
 POSITIVE_KEYWORDS = ['upgrade', 'buyout', 'acquisition', 'fda approval', 'positive results', 'earnings beat', 'new contract', 'partnership']
 NEGATIVE_KEYWORDS = ['downgrade', 'offering', 'investigation', 'lawsuit', 'earnings miss', 'delay', 'halts']
 
+def get_all_tickers():
+    """
+    Fetches a list of all stock tickers from NASDAQ, NYSE, and AMEX.
+    """
+    all_tickers = []
+    exchanges = ['nasdaq', 'nyse', 'amex']
+
+    for exchange in exchanges:
+        print(f"Fetching a list of all tickers from {exchange.upper()}...")
+        try:
+            url = f"https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&exchange={exchange}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if (
+                'data' in data
+                and data.get('data')
+                and 'table' in data['data']
+                and data['data'].get('table')
+                and 'rows' in data['data']['table']
+                and isinstance(data['data']['table']['rows'], list)
+            ):
+                tickers_data = data['data']['table']['rows']
+                # Filter for small-cap stocks under $300M market cap
+                exchange_tickers = [
+                    item['symbol']
+                    for item in tickers_data
+                    if item.get('marketCap') and item['marketCap'].replace(',', '').isdigit() and float(item['marketCap'].replace(',', '')) < MARKET_CAP_LIMIT
+                ]
+                print(f"Successfully fetched and filtered {len(exchange_tickers)} small-cap tickers from {exchange.upper()}.")
+                all_tickers.extend(exchange_tickers)
+            else:
+                print(f"Could not find 'rows' in the expected location in the API response for {exchange.upper()}.")
+
+        except Exception as e:
+            print(f"Could not fetch tickers from {exchange.upper()} API: {e}")
+            continue # Continue to the next exchange
+
+    if not all_tickers:
+        print("Could not fetch any tickers. Falling back to a default list for demonstration.")
+        return ['GME', 'AMC', 'BBBYQ', 'MULN']
+
+    return all_tickers
+
+
 def calculate_catalyst_score(news):
-    """
-    Calculates a score based on keywords found in the most recent news headline.
-    """
     score = 0
-    if not news:
-        return score
-
-    # We only check the headline of the most recent news article
+    if not news: return score
     headline = news[0].get('title', '').lower()
-
     for keyword in POSITIVE_KEYWORDS:
-        if keyword in headline:
-            score += 1
+        if keyword in headline: score += 1
     for keyword in NEGATIVE_KEYWORDS:
-        if keyword in headline:
-            score -= 1
-
+        if keyword in headline: score -= 1
     return score
 
 def calculate_squeeze_score(info):
-    """
-    Calculates a score based on "squeeze" potential (low float, high short interest).
-    """
     score = 0
-
-    # 1. Score based on float size (lower float = higher score)
     float_shares = info.get('floatShares')
     if float_shares:
-        if float_shares < 10_000_000:  # Under 10M is very low
-            score += 2
-        elif float_shares < 20_000_000: # Under 20M is low
-            score += 1
-
-    # 2. Score based on short interest (higher short % = higher score)
+        if float_shares < 10_000_000: score += 2
+        elif float_shares < 20_000_000: score += 1
     short_percent_float = info.get('shortPercentOfFloat')
     if short_percent_float:
-        # We amplify the score. A 20% short float (0.2) adds 1.0 to the score.
         score += short_percent_float * 5
-
     return score
 
 def find_and_score_gappers(tickers):
-    """
-    Finds gapping stocks and calculates a GapScore for each one.
-    """
-    print(f"Scanning {len(tickers)} tickers and calculating GapScore...")
+    if not tickers: return []
+    print(f"\nScanning {len(tickers)} tickers for gappers and calculating GapScore...")
     gappers = []
 
     for ticker_symbol in tickers:
@@ -63,11 +92,10 @@ def find_and_score_gappers(tickers):
             ticker = yf.Ticker(ticker_symbol)
             info = ticker.info
 
-            # --- Gap Calculation ---
             previous_close = info.get('previousClose')
             current_price = info.get('preMarketPrice') or info.get('regularMarketPrice')
 
-            if not previous_close or not current_price:
+            if not previous_close or not current_price or current_price == 0 or previous_close == 0:
                 continue
 
             gap_percent = (current_price - previous_close) / previous_close
@@ -75,22 +103,11 @@ def find_and_score_gappers(tickers):
             if gap_percent <= GAP_THRESHOLD:
                 continue
 
-            # --- Score Calculation ---
-            # 1. Gap Score Component (raw gap % scaled by 10)
-            gap_score_comp = gap_percent * 10
-
-            # 2. Catalyst Score Component
             news = ticker.news
+            gap_score_comp = gap_percent * 10
             catalyst_score_comp = calculate_catalyst_score(news)
-
-            # 3. Squeeze Score Component
             squeeze_score_comp = calculate_squeeze_score(info)
-
-            # NOTE: RVOL component is omitted for now to ensure screener speed.
-            # A proper implementation would require heavy historical data calls.
-            rvol_score_comp = 0
-
-            total_gap_score = gap_score_comp + catalyst_score_comp + squeeze_score_comp + rvol_score_comp
+            total_gap_score = gap_score_comp + catalyst_score_comp + squeeze_score_comp
 
             gappers.append({
                 "ticker": ticker_symbol,
@@ -105,25 +122,26 @@ def find_and_score_gappers(tickers):
                     "squeeze": f"{squeeze_score_comp:.2f}",
                 }
             })
-        except Exception as e:
-            # Silently continue if a ticker fails, to not interrupt the whole scan
+        except Exception:
             pass
 
     return gappers
 
 def main():
-    """
-    Main function to run the screener and display ranked results.
-    """
-    print("--- Rackslabs Stock Screener V2 (with GapScore) ---")
+    print("--- Rackslabs Stock Screener V2.2 (Small-Cap Discovery Edition) ---")
 
-    gapping_stocks = find_and_score_gappers(TICKERS_TO_SCAN)
+    all_tickers = get_all_tickers()
 
-    if not gapping_stocks:
-        print("\nNo stocks found matching the criteria at this time.")
+    if not all_tickers:
+        print("Could not find any small-cap stocks to scan. Exiting.")
         return
 
-    # Sort the found gappers by their GapScore in descending order
+    gapping_stocks = find_and_score_gappers(all_tickers)
+
+    if not gapping_stocks:
+        print("\nNo small-cap gappers found matching the criteria at this time.")
+        return
+
     gapping_stocks.sort(key=lambda x: x['gap_score'], reverse=True)
 
     print(f"\nFound {len(gapping_stocks)} potential gapper(s), ranked by GapScore:")
